@@ -1,0 +1,132 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+########################################################################
+# 
+# Copyright (c) 2020 Baidu.com, Inc. All Rights Reserved
+# 
+########################################################################
+ 
+"""
+File: cnn_crf.py
+Author: DST(DST@baidu.com)
+Date: 2020/11/24 16:37:30
+"""
+import tensorflow as tf
+from model.model_base import *
+from util.config import *
+from numpy.random import seed
+seed(1)
+from tensorflow import set_random_seed
+set_random_seed(2)
+class bilstm_crf(object):
+    def __init__(self, FLAGS):
+        self.config = FLAGS
+        self.add_placeholder()
+        self.input2embed()
+        self.model()
+
+    def add_placeholder(self):
+        self.input_query = tf.placeholder(tf.int32, [None, self.config.max_len], name='query_input')
+        self.seq_len = tf.placeholder(tf.int32, [None], name="seq_len")
+        self.intent_label = tf.placeholder(tf.int32, [None], name="intent_label")
+        self.slots_label = tf.placeholder(tf.int32, [None, self.config.max_len], name='slot_label')
+        self.keep_prob = tf.placeholder(tf.float32, name='slot_label')
+        self.slot_tag_size = self.config.slot_tag_size
+
+    def input2embed(self):
+        self.query_embedding = tf.get_variable(name='word_embedding',
+                                                   shape=[self.config.word_vocab_size, self.config.word_embedding_dim],
+                                                   dtype=tf.float32,
+                                                   initializer=tf.random_uniform_initializer(maxval=-1., minval=1., seed=0))
+        self.query_embed = tf.nn.embedding_lookup(self.query_embedding, self.input_query)
+        # column -> row
+        self.slot_embedding = tf.get_variable(name='slot_embedding', 
+                                         shape=[self.slot_tag_size, self.config.slot_embedding_dim], 
+                                         dtype=tf.float32,
+                                         initializer=tf.random_uniform_initializer(maxval=-1., minval=1., seed=0))
+        self.batch_size = tf.shape(self.input_query)[0]
+        self.slot_init_pad = tf.ones([self.batch_size], dtype=tf.int32, name='UNK')
+        self.slot_init_pad_embd = tf.nn.embedding_lookup(self.slot_embedding, self.slot_init_pad)
+    
+
+    def bilstm_atten(self, scope):
+        cell_fw = tf.contrib.rnn.LSTMCell(self.config.bilstm_hidden_dim)
+        cell_bw = tf.contrib.rnn.LSTMCell(self.config.bilstm_hidden_dim)
+        (output_fw_seq, output_bw_seq), (fw_state, bw_state) = tf.nn.bidirectional_dynamic_rnn(cell_fw=cell_fw, 
+                                                                             cell_bw=cell_bw, 
+                                                                             inputs=self.query_embed,
+                                                                             sequence_length=self.seq_len, 
+                                                                             dtype=tf.float32)
+        encode_outputs = tf.concat([output_fw_seq, output_bw_seq], axis=-1)
+        encode_final_state_c = tf.concat([memory_fw, memory_bw], axis=-1)
+        encode_final_state_h = tf.concat([hidden_fw, hidden_bw], axis=-1)
+
+        self.encoder_final_state = tf.contrib.rnn.LSTMStateTuple(
+            c=encoder_final_state_c,
+            h=encoder_final_state_h
+        )
+        slot_step_pad = tf.zeros([self.batch_size, self.config.bilstm_hidden_dim * 2 + self.slot_embedding_dim],dtype=tf.float32) 
+        def initial_fn():
+            initial_state_finished = (0 >= self.seq_len)
+            initial_input = tf.concat([self.slot_init_pad_embd, encoder_outputs[0]], axis=1)
+            return initial_state_finished, initial_input
+        def sample_fn(time, outputs, state):
+            pred_slot_id = tf.cast(tf.argmax(outputs, axis=1), tf.int32)
+            return pred_slot_id
+        def next_inputs_fn(time, outputs, state, sample_ids):
+            pred_slot_embed = tf.nn.embedding_lookup(self.slot_embedding, sample_ids)
+            next_input = tf.concat([pred_slot_embed, encode_outputs[time]], axis=1)
+            element_finish = (time >= self.seq_len)
+            all_finished = tf.reduce_all(elements_finished)
+            next_inputs = tf.cond(all_finished, lambda: slot_step_pad, lambda: next_input)
+            next_state = state
+            return elements_finished, next_inputs, next_state
+        bilstm_atten_helper = tf.contrib.seq2seq.CustomHelper(initial_fn, sample_fn, next_inputs_fn)
+        def decode(helper, scope, reuse=None):
+            with tf.variable_scope(scope, reuse=reuse):
+                memory = tf.transpose(encoder_outputs, [1, 0, 2])
+                attention_mechanism = tf.contrib.seq2seq.BahdanauAttention(
+                    num_units=self.config.seq_hidden_dim, memory=memory,
+                    memory_sequence_length=self.seq_len)
+                cell = tf.contrib.rnn.LSTMCell(num_units=self.config.seq_hidden_dim * 2)
+                attn_cell = tf.contrib.seq2seq.AttentionWrapper(
+                    cell, attention_mechanism, attention_layer_size=self.config.seq_hidden_dim)
+                out_cell = tf.contrib.rnn.OutputProjectionWrapper(
+                    attn_cell, self.slot_tag_size, reuse=reuse
+                )
+                decoder = tf.contrib.seq2seq.BasicDecoder(
+                    cell=out_cell, helper=helper,
+                    initial_state=out_cell.zero_state(
+                        dtype=tf.float32, batch_size=self.batch_size))
+                # initial_state=encoder_final_state)
+                final_outputs, final_state, final_sequence_lengths = tf.contrib.seq2seq.dynamic_decode(
+                    decoder=decoder, output_time_major=True,
+                    impute_finished=True, maximum_iterations=self.config,max_len
+                )
+                return final_outputs
+        self.slot_outputs = decode(my_helper, 'decode')
+
+        
+
+    def seq_loss(self):
+        with tf.name_scope("loss"):
+            
+            slot_loss, self.transition = tf.contrib.crf.crf_log_likelihood(self.slot_prob,
+                                                      self.slots_label,
+                                                      self.seq_len,
+                                                      transition_params=self.transition)
+            
+            intent_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.intent_label, logits=self.intent_prob)
+            self.loss = tf.reduce_mean(intent_loss) + 0.5 * tf.reduce_mean(-slot_loss)
+        with tf.name_scope("accuarcy"):
+            intent_predict = tf.cast(tf.argmax(self.intent_prob, axis=-1, name="predict"), dtype=tf.int32)
+            correct_predictions = tf.equal(intent_predict, self.intent_label, name='correct_predictions')
+            self.intent_accuracy = tf.reduce_mean(tf.cast(correct_predictions, "float"), name="accuracy")
+    def model(self):
+        scope = "bilstm_crf"
+        self.bilstm_atten(scope)
+        self.seq_loss()
+
+
+
+
