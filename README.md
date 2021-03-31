@@ -1,6 +1,5 @@
 # 意图和槽位联合识别 intent_join_slot
 我集成了很多篇paper的工作:  
-intent_acc: 1, slot_f1: 95.0972   
 bilstm_base: intent_acc: 0.958567,slot_f1: 91.3005    
 bilstm_crf: intent_acc: 0.921613,slot_f1: 94.0527  
 bilstm_attention: intent_acc: 0.966405,slot_f1: 92.0573  
